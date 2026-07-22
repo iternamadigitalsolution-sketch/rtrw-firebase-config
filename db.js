@@ -8,7 +8,8 @@
 //   import { getAll, addRecord, updateRecord, deleteRecord, ... } from './db.js';
 // ============================================================
 
-import { auth, db } from './firebase-config.js';
+import { auth, db, authCustomer, dbCustomer } from './firebase-config.js';
+export { authCustomer, dbCustomer };
 import {
   ref, get, set, remove
 } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js";
@@ -49,9 +50,14 @@ export function generateId(prefix) {
   return prefix + '_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5).toUpperCase();
 }
 
-// Ambil semua record dalam satu node
-export async function getAll(node) {
-  const snap = await get(ref(db, node));
+// Ambil semua record dalam satu node.
+// dbInstance opsional: default `db` (Admin). WargaView.html WAJIB
+// mengoper `dbCustomer` secara eksplisit, karena sesi login warga
+// tersimpan di app Firebase yang berbeda (authCustomer/dbCustomer) —
+// kalau tetap pakai `db` biasa, request akan dianggap belum login.
+export async function getAll(node, dbInstance) {
+  const database = dbInstance || db;
+  const snap = await get(ref(database, node));
   if (!snap.exists()) return [];
   const val = snap.val();
   return Object.keys(val).map(function (key) {
@@ -62,8 +68,9 @@ export async function getAll(node) {
 }
 
 // Ambil satu record berdasarkan ID
-export async function getOne(node, id) {
-  const snap = await get(ref(db, node + '/' + id));
+export async function getOne(node, id, dbInstance) {
+  const database = dbInstance || db;
+  const snap = await get(ref(database, node + '/' + id));
   if (!snap.exists()) return null;
   const obj = snap.val();
   obj.ID = obj.ID || id;
@@ -71,28 +78,31 @@ export async function getOne(node, id) {
 }
 
 // Tambah record baru
-export async function addRecord(node, dataObj, prefix) {
+export async function addRecord(node, dataObj, prefix, dbInstance) {
+  const database = dbInstance || db;
   if (!dataObj.ID) {
     dataObj.ID = generateId(prefix || node.substring(0, 3).toUpperCase());
   }
-  await set(ref(db, node + '/' + dataObj.ID), dataObj);
+  await set(ref(database, node + '/' + dataObj.ID), dataObj);
   return dataObj;
 }
 
 // Update sebagian field record (merge, bukan timpa total)
-export async function updateRecord(node, id, dataObj) {
-  const current = await getOne(node, id);
+export async function updateRecord(node, id, dataObj, dbInstance) {
+  const database = dbInstance || db;
+  const current = await getOne(node, id, database);
   if (!current) throw new Error('Data tidak ditemukan.');
   const merged = Object.assign({}, current, dataObj);
-  await set(ref(db, node + '/' + id), merged);
+  await set(ref(database, node + '/' + id), merged);
   return merged;
 }
 
 // Hapus record
-export async function deleteRecord(node, id) {
-  const current = await getOne(node, id);
+export async function deleteRecord(node, id, dbInstance) {
+  const database = dbInstance || db;
+  const current = await getOne(node, id, database);
   if (!current) throw new Error('Data tidak ditemukan.');
-  await remove(ref(db, node + '/' + id));
+  await remove(ref(database, node + '/' + id));
   return true;
 }
 
@@ -145,6 +155,37 @@ export function doLogout() {
 }
 
 // ============================================================
+// AUTH GUARD — versi WARGA, dipanggil di WargaView.html.
+// Pakai authCustomer/dbCustomer (app Firebase ke-3) supaya sesi
+// warga tidak numpang/tabrakan dengan sesi Admin kalau device sama.
+// ============================================================
+export function requireWarga(onReady) {
+  onAuthStateChanged(authCustomer, async function (user) {
+    if (!user) { window.location.href = '/'; return; }
+    try {
+      const roleSnap = await get(ref(dbCustomer, 'Users/' + user.uid + '/role'));
+      const role = roleSnap.exists() ? roleSnap.val() : null;
+      if (role !== 'warga') {
+        alert('Akun ini bukan akun warga. Hubungi pengurus RT/RW.');
+        await signOut(authCustomer);
+        window.location.href = '/';
+        return;
+      }
+      onReady(user);
+    } catch (err) {
+      alert('Gagal memeriksa akses: ' + err.message);
+      window.location.href = '/';
+    }
+  });
+}
+
+export function doLogoutWarga() {
+  return signOut(authCustomer).then(function () {
+    window.location.href = '/';
+  });
+}
+
+// ============================================================
 // HELPER: No HP & Password default (dd/mm/yyyy jadi email sintetis
 // + password) — pola sama seperti TreeNet, disesuaikan penamaan
 // domain sintetisnya jadi '@warga.rtrwdigital'.
@@ -165,9 +206,19 @@ export function normalizeNoHP(noHP) {
   return cleaned;
 }
 
-// Email sintetis dari No HP, dipakai untuk daftar/login Firebase Auth
+// Email sintetis dari No HP, dipakai khusus utk WARGA (Username WARGA = No HP)
 export function emailSintetisDariNoHP(noHP) {
   return normalizeNoHP(noHP) + '@warga.rtrwdigital';
+}
+
+// Email sintetis generik dari Username — dipakai untuk SEMUA role
+// (Admin, Bendahara, dst yang username-nya BUKAN No HP, maupun Warga
+// yang username-nya No HP). Login tetap cocok dengan field "Username"
+// apa adanya, persis logika login() di Code.gs lama.
+export function emailSintetisDariUsername(username) {
+  var bersih = String(username).trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
+  if (!bersih) throw new Error('Username tidak valid.');
+  return bersih + '@rtrwdigital.internal';
 }
 
 // Password default dari tanggal lahir (format input date: yyyy-mm-dd)
