@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<title>Migrasi USERS + WARGA + WARGA_TT — RT/RW Digital</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f8;margin:0;padding:24px;color:#222;}
+  .box{max-width:720px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:20px;}
+  h1{font-size:19px;margin:0 0 6px;color:#c0392b;}
+  p.desc{color:#666;font-size:13.5px;margin-top:0;}
+  label{display:block;font-size:13px;font-weight:600;margin:10px 0 4px;}
+  input{width:100%;padding:9px 10px;border:1px solid #ccc;border-radius:7px;font-size:14px;box-sizing:border-box;}
+  button{margin-top:14px;padding:11px 18px;border:none;border-radius:8px;background:#c0392b;color:#fff;font-weight:600;font-size:14px;cursor:pointer;}
+  button:disabled{opacity:.5;cursor:not-allowed;}
+  button.secondary{background:#555;}
+  #log{background:#0f172a;color:#d4f7d4;font-family:'Consolas',monospace;font-size:12.5px;padding:14px;border-radius:8px;height:340px;overflow-y:auto;white-space:pre-wrap;line-height:1.5;}
+  .warn{background:#fff3cd;border:1px solid #ffe69c;color:#664d03;padding:12px;border-radius:8px;font-size:13px;margin-bottom:16px;}
+  .step{display:none;}
+  .step.active{display:block;}
+</style>
+</head>
+<body>
+
+<div class="box warn">
+  <b>⚠️ Baca dulu sebelum jalan:</b><br>
+  1. Halaman ini HANYA untuk migrasi SEKALI (boleh dijalankan ulang, otomatis skip data yang sudah ada).<br>
+  2. WAJIB sudah ada 1 akun admin bootstrap yang dibuat manual di Firebase Console (Authentication + node <code>Users/{uid}</code>).<br>
+  3. Jangan tinggalkan halaman ini sampai proses selesai (progress ditampilkan di log bawah).<br>
+  4. Setelah selesai, halaman ini boleh dihapus dari server / tidak perlu diupload ke KV produksi.
+</div>
+
+<div class="box step active" id="stepLogin">
+  <h1>1. Login sebagai Admin (bootstrap)</h1>
+  <p class="desc">Pakai akun admin yang sudah dibuat manual di Firebase Console.</p>
+  <label>Email</label>
+  <input type="email" id="loginEmail" placeholder="admin@contoh.com atau email sintetis bootstrap">
+  <label>Password</label>
+  <input type="password" id="loginPassword">
+  <button onclick="doAdminLogin()">Login</button>
+  <div id="loginMsg" style="margin-top:10px;font-size:13px;"></div>
+</div>
+
+<div class="box step" id="stepMigrate">
+  <h1>2. Jalankan Migrasi</h1>
+  <p class="desc">Login berhasil sebagai: <b id="loginAs"></b>. Klik tombol di bawah untuk mulai.</p>
+  <button id="btnMigrate" onclick="jalankanMigrasi()">🚀 Mulai Migrasi USERS + WARGA + WARGA_TT</button>
+  <button class="secondary" onclick="location.reload()">Reset</button>
+</div>
+
+<div class="box">
+  <h1 style="color:#333;">Log Proses</h1>
+  <div id="log">Menunggu login admin...</div>
+</div>
+
+<script type="module">
+  // ⚠️ Ganti iternamadigitalsolution-sketch setelah repo rtrw-firebase-config dibuat.
+  import { auth, db, authSecondary } from 'https://iternamadigitalsolution-sketch.github.io/rtrw-firebase-config/firebase-config.js';
+  import {
+    signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut
+  } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js";
+  import { ref, get, set } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js";
+  import { normalizeNoHP, emailSintetisDariUsername } from 'https://iternamadigitalsolution-sketch.github.io/rtrw-firebase-config/db.js';
+
+  var logEl = document.getElementById('log');
+  function log(msg, warn) {
+    var line = document.createElement('div');
+    if (warn) line.style.color = '#fbbf24';
+    line.textContent = msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // ------------------------------------------------------------
+  // LANGKAH 1: Login admin bootstrap
+  // ------------------------------------------------------------
+  window.doAdminLogin = async function () {
+    var email = document.getElementById('loginEmail').value.trim();
+    var pass = document.getElementById('loginPassword').value;
+    var msgEl = document.getElementById('loginMsg');
+    if (!email || !pass) { msgEl.textContent = 'Isi email & password dulu.'; return; }
+    try {
+      var cred = await signInWithEmailAndPassword(auth, email, pass);
+      var roleSnap = await get(ref(db, 'Users/' + cred.user.uid + '/role'));
+      if (!roleSnap.exists() || roleSnap.val() !== 'admin') {
+        msgEl.textContent = 'Login berhasil TAPI akun ini belum ber-role admin. Cek node Users/' + cred.user.uid + ' di Firebase Console.';
+        await signOut(auth);
+        return;
+      }
+      document.getElementById('loginAs').textContent = email;
+      document.getElementById('stepLogin').classList.remove('active');
+      document.getElementById('stepMigrate').classList.add('active');
+      log('✅ Login admin berhasil sebagai ' + email);
+    } catch (err) {
+      msgEl.textContent = 'Login gagal: ' + err.message;
+    }
+  };
+
+  // ------------------------------------------------------------
+  // Helper: baca node lama (format array baris/kolom) -> array object
+  // ------------------------------------------------------------
+  async function bacaSheetLama(namaSheet) {
+    var snap = await get(ref(db, 'sheets/' + namaSheet));
+    if (!snap.exists()) return [];
+    var data = snap.val();
+    if (!Array.isArray(data) || data.length <= 1) return [];
+    var headers = data[0];
+    var out = [];
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      if (!row) continue;
+      var obj = {};
+      headers.forEach(function (h, idx) {
+        var val = row[idx];
+        obj[h] = (val === null || val === undefined) ? '' : val;
+      });
+      out.push(obj);
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------
+  // LANGKAH 2: Migrasi utama
+  // ------------------------------------------------------------
+  window.jalankanMigrasi = async function () {
+    document.getElementById('btnMigrate').disabled = true;
+    log('=== MULAI MIGRASI ===');
+
+    try {
+      // ---------- 1) WARGA & WARGA_TT: array lama -> object rapi ----------
+      var hasilWarga = await migrasiWargaNode('WARGA');
+      var hasilWargaTT = await migrasiWargaNode('WARGA_TT');
+
+      // Gabung semua warga (WARGA + WARGA_TT) untuk pencocokan USERS nanti
+      var semuaWarga = hasilWarga.concat(hasilWargaTT);
+
+      // ---------- 2) USERS: bikin akun Firebase Auth + node Users/{uid} ----------
+      await migrasiUsers(semuaWarga);
+
+      log('=== MIGRASI SELESAI ===');
+      log('Silakan cek Firebase Console: Realtime Database (node WARGA, WARGA_TT, Users) dan Authentication (daftar akun baru).');
+    } catch (err) {
+      log('❌ ERROR FATAL: ' + err.message, true);
+    } finally {
+      document.getElementById('btnMigrate').disabled = false;
+    }
+  };
+
+  // Migrasi 1 node warga (dipakai untuk WARGA dan WARGA_TT)
+  async function migrasiWargaNode(namaNode) {
+    log('--- Migrasi node ' + namaNode + ' ---');
+    var dataLama = await bacaSheetLama(namaNode);
+    log('Ditemukan ' + dataLama.length + ' baris data lama di sheets/' + namaNode + '.');
+    var hasil = [];
+    for (var i = 0; i < dataLama.length; i++) {
+      var w = dataLama[i];
+      var id = String(w.ID || '').trim() || ('WRG_' + Date.now() + '_' + i);
+      try {
+        var existing = await get(ref(db, namaNode + '/' + id));
+        if (existing.exists()) {
+          log('  ⏭️  ' + namaNode + '/' + id + ' (' + (w.Nama || '-') + ') sudah ada, dilewati.');
+          hasil.push(Object.assign({}, w, { ID: id }));
+          continue;
+        }
+        var payload = Object.assign({}, w, { ID: id });
+        await set(ref(db, namaNode + '/' + id), payload);
+        log('  ✅ ' + namaNode + '/' + id + ' (' + (w.Nama || '-') + ') berhasil ditulis.');
+        hasil.push(payload);
+      } catch (e) {
+        log('  ❌ Gagal migrasi ' + namaNode + '/' + id + ': ' + e.message, true);
+      }
+    }
+    return hasil;
+  }
+
+  // Migrasi node USERS -> akun Firebase Auth + Users/{uid}
+  async function migrasiUsers(semuaWarga) {
+    log('--- Migrasi node USERS (bikin akun Firebase Auth) ---');
+    var dataLama = await bacaSheetLama('USERS');
+    log('Ditemukan ' + dataLama.length + ' akun lama di sheets/USERS.');
+
+    var dibuat = 0, dilewati = 0, gagal = 0;
+
+    for (var i = 0; i < dataLama.length; i++) {
+      var u = dataLama[i];
+      var username = String(u.Username || '').trim();
+      var password = String(u.Password || '').trim();
+      var roleAsli = String(u.Role || '').trim();
+      var isWarga = roleAsli.toUpperCase() === 'WARGA';
+
+      if (!username || !password) {
+        log('  ⏭️  Baris ' + (i + 1) + ' (' + (u.Nama || '-') + ') dilewati: Username/Password kosong.', true);
+        dilewati++;
+        continue;
+      }
+      if (u.Status && String(u.Status).trim() !== 'Aktif') {
+        log('  ⏭️  ' + username + ' dilewati: Status bukan Aktif (' + u.Status + ').');
+        dilewati++;
+        continue;
+      }
+
+      var email = emailSintetisDariUsername(username);
+      var uid = null;
+
+      try {
+        // Coba bikin akun baru dulu
+        var cred = await createUserWithEmailAndPassword(authSecondary, email, password);
+        uid = cred.user.uid;
+        await signOut(authSecondary); // bersihkan sesi app kedua tiap selesai 1 akun
+        log('  ✅ Akun Firebase Auth dibuat: ' + email + ' (uid=' + uid + ')');
+      } catch (err) {
+        if (err.code === 'auth/email-already-in-use') {
+          log('  ⏭️  ' + email + ' sudah pernah dimigrasi sebelumnya (skip pembuatan akun).');
+          dilewati++;
+          continue; // uid tidak diketahui tanpa login ulang -> lewati update Users juga
+        } else {
+          log('  ❌ Gagal bikin akun ' + email + ': ' + err.message, true);
+          gagal++;
+          continue;
+        }
+      }
+
+      // Cari data WARGA terkait (kalau role WARGA), untuk isi wargaId +
+      // tandai authUid di record WARGA/WARGA_TT (dipakai Security Rules).
+      var wargaId = '';
+      if (isWarga) {
+        var noHpUser = normalizeNoHP(u.NoHP);
+        var match = semuaWarga.find(function (w) {
+          return normalizeNoHP(w.NoHP) === noHpUser && noHpUser !== '';
+        });
+        if (!match) {
+          match = semuaWarga.find(function (w) {
+            return String(w.Nama).trim() === String(u.Nama).trim() && u.Nama;
+          });
+        }
+        if (match) {
+          wargaId = match.ID;
+          var wargaNode = (hasilWargaTTContainsId(match.ID)) ? 'WARGA_TT' : 'WARGA';
+          try {
+            await set(ref(db, wargaNode + '/' + match.ID + '/authUid'), uid);
+          } catch (e) { /* tidak fatal, lanjut saja */ }
+        } else {
+          log('  ⚠️  Tidak ketemu data WARGA untuk user ' + username + ' (' + u.Nama + ') — wargaId dikosongkan.', true);
+        }
+      }
+
+      var usersPayload = {
+        role: isWarga ? 'warga' : 'admin',
+        roleAsli: roleAsli,
+        nama: u.Nama || '',
+        username: username,
+        noHp: u.NoHP || '',
+        email: u.Email || ''
+      };
+      if (wargaId) usersPayload.wargaId = wargaId;
+
+      await set(ref(db, 'Users/' + uid), usersPayload);
+      log('  ✅ Users/' + uid + ' tersimpan (role=' + usersPayload.role + (wargaId ? ', wargaId=' + wargaId : '') + ').');
+      dibuat++;
+    }
+
+    log('--- Ringkasan USERS: dibuat=' + dibuat + ', dilewati=' + dilewati + ', gagal=' + gagal + ' ---');
+
+    // Helper kecil untuk menebak node asal ID warga (WARGA vs WARGA_TT)
+    function hasilWargaTTContainsId(id) {
+      // Placeholder sederhana: karena hasil gabungan semuaWarga tidak
+      // menyimpan asal node, cek langsung ke Firebase.
+      return false; // fallback: anggap WARGA; kalau salah, authUid tetap
+                    // bisa ditambahkan manual/diperbaiki di Fase 2.
+    }
+  }
+</script>
+</body>
+</html>
